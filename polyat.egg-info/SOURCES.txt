@@ -1,0 +1,10 @@
+LICENSE
+README.md
+setup.py
+polyat/__init__.py
+polyat/polyat.py
+polyat.egg-info/PKG-INFO
+polyat.egg-info/SOURCES.txt
+polyat.egg-info/dependency_links.txt
+polyat.egg-info/entry_points.txt
+polyat.egg-info/top_level.txt

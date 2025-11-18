@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: polyat
+Version: 0.1.0
+Summary: Tool for summarizing poly-A/T homopolymers in sequencing reads
+Home-page: https://github.com/DaanJansen94/polyat
+Author: Daan Jansen
+Author-email: jansendaan94@gmail.com
+Requires-Python: >=3.8
+License-File: LICENSE
+Dynamic: author
+Dynamic: author-email
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: requires-python
+Dynamic: summary
