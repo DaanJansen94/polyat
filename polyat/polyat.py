@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import json
 import sys
+from collections import defaultdict
 from html import escape
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Iterable
+
+HISTOGRAM_MIN_LENGTH = 10
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -70,11 +74,12 @@ def sanitize_sample_name(file_path: Path) -> str:
     return name
 
 
-def count_poly_runs(file_path: Path) -> Tuple[int, int, int, int]:
+def count_poly_runs(file_path: Path) -> tuple[int, int, int, int, dict[int, int]]:
     total = 0
     poly10 = 0
     poly15 = 0
     poly20 = 0
+    histogram: dict[int, int] = defaultdict(int)
     with open_fastq(file_path) as handle:
         while True:
             header = handle.readline()
@@ -93,7 +98,9 @@ def count_poly_runs(file_path: Path) -> Tuple[int, int, int, int]:
                 poly15 += 1
             if longest >= 20:
                 poly20 += 1
-    return total, poly10, poly15, poly20
+            if longest >= HISTOGRAM_MIN_LENGTH:
+                histogram[longest] += 1
+    return total, poly10, poly15, poly20, dict(histogram)
 
 
 def longest_poly_run(sequence: str) -> int:
@@ -121,13 +128,60 @@ def format_percent(count: int, total: int) -> str:
     return f"{(count * 100) / total:.2f}"
 
 
+def build_filterable_table(
+    table_id: str, title: str, headers: list[tuple[str, str]], rows: list[list[str]]
+) -> str:
+    parts: list[str] = [
+        "<section>",
+        f"<h2>{escape(title)}</h2>",
+        f"<table data-filterable='true' id='{escape(table_id)}'>",
+        "<thead>",
+        "<tr>",
+    ]
+    for label, _type in headers:
+        parts.append(f"<th>{escape(label)}</th>")
+    parts.append("</tr>")
+    parts.append("<tr class='filters'>")
+    for idx, (_label, col_type) in enumerate(headers):
+        if col_type == "number":
+            placeholder = "min value"
+            input_type = "number"
+        else:
+            placeholder = "text"
+            input_type = "text"
+        parts.append(
+            "<th>"
+            f"<input data-col='{idx}' data-type='{col_type}' "
+            f"type='{input_type}' placeholder='{placeholder}' />"
+            "</th>"
+        )
+    parts.append("</tr></thead><tbody>")
+    for row in rows:
+        parts.append("<tr>")
+        parts.extend(f"<td>{escape(value)}</td>" for value in row)
+        parts.append("</tr>")
+    parts.extend(["</tbody></table>", "</section>"])
+    return "\n".join(parts)
+
+
 def write_html_summary(
-    output_dir: Path, headers: list[tuple[str, str]], rows: list[list[str]]
+    output_dir: Path,
+    summary_headers: list[tuple[str, str]],
+    summary_rows: list[list[str]],
+    histogram_series: dict[str, list[list[int]]],
+    sample_order: list[str],
 ) -> None:
-    output_file = output_dir / "polyA_counts.html"
+    output_file = output_dir / "polyA_report.html"
     css = (
         "body{font-family:Arial,sans-serif;margin:20px;background:#fefefe;}"
         "h1{margin-bottom:0.5em;}"
+        "section{margin-bottom:30px;}"
+        "#histogram-section label{display:block;margin-bottom:6px;font-weight:bold;}"
+        "#histogram-section select{padding:6px 10px;margin-bottom:12px;}"
+        "#histogram-canvas{width:100%;max-width:900px;height:auto;border:1px solid #ddd;background:#fff;}"
+        ".hist-tooltip{position:absolute;padding:6px 10px;background:rgba(0,0,0,0.75);"
+        "color:#fff;border-radius:4px;font-size:12px;pointer-events:none;"
+        "transform:translate(-50%,-120%);white-space:nowrap;display:none;z-index:10;}"
         "table{border-collapse:collapse;width:100%;font-family:Arial,sans-serif;}"
         "th,td{border:1px solid #ccc;padding:8px;text-align:center;}"
         "th{background-color:#f4f4f4;}"
@@ -135,11 +189,14 @@ def write_html_summary(
         ".filters input{width:100%;box-sizing:border-box;padding:4px;}"
         "tr:nth-child(even){background:#fafafa;}"
     )
+    histogram_json = json.dumps(histogram_series)
+    sample_json = json.dumps(sample_order)
     script = (
-        "const table=document.getElementById('polyat-table');"
+        "document.querySelectorAll('table[data-filterable]').forEach(table=>{"
         "const columnFilters=table.querySelectorAll('thead input[data-col]');"
+        "const rows=table.querySelectorAll('tbody tr');"
         "function applyFilters(){"
-        "table.querySelectorAll('tbody tr').forEach(row=>{"
+        "rows.forEach(row=>{"
         "let visible=true;"
         "columnFilters.forEach(input=>{"
         "if(!visible)return;"
@@ -166,6 +223,130 @@ def write_html_summary(
         "}"
         "columnFilters.forEach(input=>input.addEventListener('input',applyFilters));"
         "applyFilters();"
+        "});"
+        f"const histogramData = {histogram_json};"
+        f"const histogramSamples = {sample_json};"
+        "const sampleSelect = document.getElementById('histogram-sample');"
+        "const canvas = document.getElementById('histogram-canvas');"
+        "const tooltip = document.getElementById('histogram-tooltip');"
+        "const ctx = canvas ? canvas.getContext('2d') : null;"
+        "let histogramBars = [];"
+        "function showTooltip(bar, event){"
+        "if(!tooltip || !bar)return;"
+        "tooltip.textContent = `Length: ${bar.length} nt | Reads: ${bar.count}`;"
+        "tooltip.style.display='block';"
+        "tooltip.style.left = `${event.clientX}px`;"
+        "tooltip.style.top = `${event.clientY}px`;"
+        "}"
+        "function hideTooltip(){"
+        "if(tooltip){tooltip.style.display='none';}"
+        "}"
+        "function renderHistogram(sample){"
+        "if(!ctx)return;"
+        "ctx.clearRect(0,0,canvas.width,canvas.height);"
+        "histogramBars = [];"
+        "const entries = histogramData[sample] || [];"
+        "const margin = 60;"
+        "const width = canvas.width - margin * 2;"
+        "const height = canvas.height - margin * 2;"
+        "ctx.strokeStyle = '#333';"
+        "ctx.fillStyle = '#333';"
+        "ctx.lineWidth = 1;"
+        "ctx.font = '12px Arial';"
+        "ctx.beginPath();"
+        "ctx.moveTo(margin, margin);"
+        "ctx.lineTo(margin, margin + height);"
+        "ctx.lineTo(margin + width, margin + height);"
+        "ctx.stroke();"
+        "if(entries.length === 0){"
+        f"ctx.fillText('No data for selected sample (no runs >={HISTOGRAM_MIN_LENGTH} nt).', margin, margin);"
+        "return;"
+        "}"
+        "const maxCount = Math.max(...entries.map(item => item[1]));"
+        "if(maxCount === 0){"
+        "ctx.fillText('All counts are zero for this sample.', margin, margin);"
+        "return;"
+        "}"
+        "const tickCount = 5;"
+        "const tickStep = maxCount / tickCount;"
+        "ctx.fillStyle = '#000';"
+        "ctx.textAlign = 'right';"
+        "ctx.textBaseline = 'middle';"
+        "for(let i=0;i<=tickCount;i++){"
+        "const value = Math.round(i * tickStep);"
+        "const y = margin + height - (value / maxCount) * height;"
+        "ctx.beginPath();"
+        "ctx.moveTo(margin - 5, y);"
+        "ctx.lineTo(margin, y);"
+        "ctx.stroke();"
+        "ctx.fillText(String(value), margin - 8, y);"
+        "ctx.strokeStyle='#eee';"
+        "ctx.beginPath();"
+        "ctx.moveTo(margin, y);"
+        "ctx.lineTo(margin + width, y);"
+        "ctx.stroke();"
+        "ctx.strokeStyle='#333';"
+        "}"
+        "ctx.textAlign = 'center';"
+        "ctx.textBaseline = 'middle';"
+        "ctx.fillText('Count', margin - 35, margin - 20);"
+        "ctx.fillText('Run length (nt)', margin + width / 2, margin + height + 45);"
+        "const barWidth = width / entries.length;"
+        "entries.forEach((item, index) => {"
+        "const length = item[0];"
+        "const count = item[1];"
+        "const barHeight = (count / maxCount) * height;"
+        "const x = margin + index * barWidth + barWidth * 0.1;"
+        "const y = margin + height - barHeight;"
+        "const w = barWidth * 0.8;"
+        "const h = barHeight || (count > 0 ? 1 : 0);"
+        "ctx.fillStyle = '#4a90e2';"
+        "ctx.fillRect(x, y, w, h);"
+        "histogramBars.push({x,y,width:w,height:h,count,length});"
+        "if(entries.length <= 40){"
+        "ctx.save();"
+        "ctx.translate(x + w / 2, margin + height + 15);"
+        "ctx.rotate(-Math.PI / 4);"
+        "ctx.fillStyle = '#000';"
+        "ctx.fillText(String(length), 0, 0);"
+        "ctx.restore();"
+        "}"
+        "});"
+        "}"
+        "function initHistogram(){"
+        "if(!sampleSelect || !canvas || !ctx)return;"
+        "sampleSelect.innerHTML='';"
+        "histogramSamples.forEach(sample => {"
+        "const option=document.createElement('option');"
+        "option.value=sample;"
+        "option.textContent=sample;"
+        "sampleSelect.appendChild(option);"
+        "});"
+        "if(histogramSamples.length>0){"
+        "sampleSelect.value = histogramSamples[0];"
+        "renderHistogram(sampleSelect.value);"
+        "}else if(ctx){"
+        "ctx.font='16px Arial';"
+        "ctx.fillText('No histogram data available', 10, 30);"
+        "}"
+        "sampleSelect.addEventListener('change', () => {"
+        "hideTooltip();"
+        "renderHistogram(sampleSelect.value);"
+        "});"
+        "canvas.addEventListener('mousemove', (event) => {"
+        "const rect = canvas.getBoundingClientRect();"
+        "const x = event.clientX - rect.left;"
+        "const y = event.clientY - rect.top;"
+        "const bar = histogramBars.find(b => x>=b.x && x<=b.x+b.width && y>=b.y && y<=b.y+b.height);"
+        "if(bar && bar.count>0){"
+        "showTooltip(bar, event);"
+        "}else{"
+        "hideTooltip();"
+        "}"
+        "});"
+        "canvas.addEventListener('mouseleave', hideTooltip);"
+        "}"
+        "initHistogram();"
     )
     parts = [
         "<!DOCTYPE html>",
@@ -176,41 +357,21 @@ def write_html_summary(
         f"<style>{css}</style>",
         "</head>",
         "<body>",
-        "<h1>polyA/T Summary</h1>",
-        "<table id='polyat-table'>",
-        "<thead>",
-        "<tr>",
+        "<h1>polyA/T Report</h1>",
+        build_filterable_table(
+            "polyat-summary-table", "polyA/T Summary", summary_headers, summary_rows
+        ),
+        "<section id='histogram-section'>",
+        f"<h2>polyA/T Histogram (>={HISTOGRAM_MIN_LENGTH} nt)</h2>",
+        "<label for='histogram-sample'>Sample</label>",
+        "<select id='histogram-sample'></select>",
+        "<canvas id='histogram-canvas' width='900' height='400'></canvas>",
+        "<div id='histogram-tooltip' class='hist-tooltip'></div>",
+        "</section>",
+        f"<script>{script}</script>",
+        "</body>",
+        "</html>",
     ]
-    for label, _type in headers:
-        parts.append(f"<th>{escape(label)}</th>")
-    parts.append("</tr>")
-    parts.append("<tr class='filters'>")
-    for idx, (_label, col_type) in enumerate(headers):
-        if col_type == "number":
-            placeholder = "min value"
-            input_type = "number"
-        else:
-            placeholder = "text"
-            input_type = "text"
-        parts.append(
-            "<th>"
-            f"<input data-col='{idx}' data-type='{col_type}' "
-            f"type='{input_type}' placeholder='{placeholder}' />"
-            "</th>"
-        )
-    parts.append("</tr></thead><tbody>")
-    for row in rows:
-        parts.append("<tr>")
-        parts.extend(f"<td>{escape(value)}</td>" for value in row)
-        parts.append("</tr>")
-    parts.extend(
-        [
-            "</tbody></table>",
-            f"<script>{script}</script>",
-            "</body>",
-            "</html>",
-        ]
-    )
     output_file.write_text("\n".join(parts), encoding="utf-8")
 
 
@@ -224,7 +385,7 @@ def main(argv: list[str] | None = None) -> None:
     if not fastq_files:
         sys.exit(f"[error] No FASTQ/FASTQ.GZ files found in {input_dir}")
 
-    headers = [
+    summary_headers = [
         ("Sample", "text"),
         ("Total_Reads", "number"),
         ("PolyA/T_10+", "number"),
@@ -234,14 +395,16 @@ def main(argv: list[str] | None = None) -> None:
         ("Percent_15+", "number"),
         ("Percent_20+", "number"),
     ]
-    header_line = "\t".join(label for label, _type in headers)
-    html_rows: list[list[str]] = []
+    header_line = "\t".join(label for label, _type in summary_headers)
+    summary_rows: list[list[str]] = []
+    histogram_data: dict[str, dict[int, int]] = {}
+    sample_order: list[str] = []
 
     with open(output_file, "w", encoding="utf-8") as out_handle:
         out_handle.write(header_line + "\n")
         for file_path in fastq_files:
             sample = sanitize_sample_name(file_path)
-            total, poly10, poly15, poly20 = count_poly_runs(file_path)
+            total, poly10, poly15, poly20, histogram = count_poly_runs(file_path)
             pct10 = format_percent(poly10, total)
             pct15 = format_percent(poly15, total)
             pct20 = format_percent(poly20, total)
@@ -250,7 +413,7 @@ def main(argv: list[str] | None = None) -> None:
                 f"{pct10}\t{pct15}\t{pct20}"
             )
             out_handle.write(line + "\n")
-            html_rows.append(
+            summary_rows.append(
                 [
                     sample,
                     str(total),
@@ -262,11 +425,33 @@ def main(argv: list[str] | None = None) -> None:
                     pct20,
                 ]
             )
+            histogram_data[sample] = histogram
+            sample_order.append(sample)
 
-    write_html_summary(output_dir, headers, html_rows)
+    histogram_file = output_dir / "polyA_histogram.txt"
+    histogram_series: dict[str, list[list[int]]] = {}
+    with open(histogram_file, "w", encoding="utf-8") as hist_handle:
+        hist_handle.write("Sample\tRun_Length\tRead_Count\n")
+        for sample in sample_order:
+            hist = histogram_data.get(sample, {})
+            if not hist:
+                histogram_series[sample] = []
+                continue
+            max_length = max(hist)
+            series: list[list[int]] = []
+            for length in range(HISTOGRAM_MIN_LENGTH, max_length + 1):
+                count = hist.get(length, 0)
+                hist_handle.write(f"{sample}\t{length}\t{count}\n")
+                series.append([length, count])
+            histogram_series[sample] = series
+
+    write_html_summary(
+        output_dir, summary_headers, summary_rows, histogram_series, sample_order
+    )
 
     print(f"[polyat] Summary written to {output_file}")
-    print(f"[polyat] HTML summary written to {output_dir / 'polyA_counts.html'}")
+    print(f"[polyat] Histogram written to {histogram_file}")
+    print(f"[polyat] HTML report written to {output_dir / 'polyA_report.html'}")
 
 
 if __name__ == "__main__":
