@@ -19,7 +19,7 @@ you can use for quick QC across samples.
 Clone and install from source code:
 
 ```bash
-git clone https://github.com/your-org/polyat.git
+git clone https://github.com/DaanJansen94/polyat.git
 cd polyat
 pip install .
 ```
