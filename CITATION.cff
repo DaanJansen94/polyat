@@ -15,6 +15,6 @@ authors:
 doi: ""
 title: "polyat: Poly-A/T summarization"
 version: v0.1.0
-url: https://github.com/your-org/polyat
+url: https://github.com/DaanJansen94/polyat
 date-released: 2025-11-18
 abstract: "A command-line tool for summarizing poly-A/T homopolymers derived from carrier RNA present in sequencing reads (FASTQ)."
